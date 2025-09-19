@@ -1,28 +1,31 @@
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
+from pydantic_extra_types.language_code import LanguageAlpha2
 
-from config import ModelManagerConfig
-from model_management.manager import ModelManager
+from model_management.registry import ModelRegistry
 from schemas import TranslationRequest, TranslationResponse
 
-# Global reference (set at startup)
-model_manager: ModelManager | None = None
+
+async def run_translation(app: FastAPI, text: str, source: LanguageAlpha2, target: LanguageAlpha2,
+                          beam_size: int | None = None) -> str:
+    registry: ModelRegistry = app.state.model_registry
+    try:
+        model = registry.get(source, target)
+    except KeyError:
+        raise HTTPException(status_code=400, detail=f"Unsupported language pair: {source}-{target}")
+
+    return model.translate(text, beam_size=beam_size)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global model_manager
-    model_manager = ModelManager(
-        ModelManagerConfig(
-            model_dir=Path()
-        )
-    )
+    registry = ModelRegistry()
+    registry.discover_and_register("models")
+    app.state.model_registry = registry
     print("✅ Models loaded into memory")
     yield
-    model_manager = None
-    print("🛑 Models released")
+    app.state.model_registry = None
 
 
 app = FastAPI(title="AI Inference Service", lifespan=lifespan)
@@ -36,7 +39,9 @@ def health():
 @app.post("/translate", response_model=TranslationResponse)
 async def translate(req: TranslationRequest):
     try:
-        output = await model_manager.translate(req.text, req.source_lang, req.target_lang)
+        output = await run_translation(app, req.text, req.source_lang, req.target_lang, req.beam_size)
         return TranslationResponse(translation=output)
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
